@@ -5,7 +5,7 @@ import openai
 
 from flask import Flask, jsonify, request
 from flask_sqlalchemy import SQLAlchemy
-from requests import Session
+from sqlalchemy.exc import NoResultFound
 
 from app.models import *
 
@@ -27,9 +27,7 @@ default_gpt_model = os.environ.get("OPENAI_API_MODEL", default="gpt-4")
 @app.route('/logs', methods=['GET'])
 def get_logs():
     """Endpoint to retrieve logs."""
-    session = Session()
     logs = db.session.query(FoodLog).all()
-    session.close()
     return jsonify([log.to_dict() for log in logs])  # Assuming you have a method to_dict in FoodLog model
 
 
@@ -52,89 +50,108 @@ def create_log():
 @app.route('/users', methods=['GET'])
 def get_users():
     """Endpoint to retrieve users."""
-    session = Session()
     users = db.session.query(User).all()
-    session.close()
     return jsonify([user.to_dict() for user in users])
 
 
 @app.route('/foods', methods=['GET'])
 def get_foods():
     """Endpoint to retrieve foods."""
-    session = Session()
     items = db.session.query(Food).all()
-    session.close()
     return jsonify([item.to_dict() for item in items])
 
 
 @app.route('/gpt', methods=['POST'])
 def call_gpt():
-    food = get_foods()
+    request_query = str(request.json["message"])
+    request_model = request.json.get("model", default_gpt_model)
 
-    messages = [{
-        "role": "system",
-        "content": """
-        Create a json object with nutritional information about what is described to you. Sometimes
-        you will need to guess the nutritional information. For liquids prefer 100 grams. For example, 
-        if a user wants to track a glass of milk, and there isn't the food item in the context. New 
-        foods should also be updated when a new conversion is needed, but in that case you can skip
-        macros and calories if they are not changed. Example:
-        
-        "A glass of milk and a cookie"
-        
-        { "new_foods": [ {
-            "name": "1% Milk",
-            "quantity": 100,
-            "quantity_units": "grams",
-            "calories": 123.33333333333334,
-            "conversions": { "cups": 0.425 },
-            "macros": {
-                "carbs": 0.002,
-                "fat": 10.7,
-                "protein": 0.02
-            }, {
-            "name": "Chocolate Chip Cookie",
-            "quantity": 1,
-            "quantity_units": "cookies",
-            "calories": 4000,
-            "conversions": { "grams": 50 },
-            "macros": {
-                "carbs": 30,
-                "fat": 20,
-                "protein": 3
-            }
-        ], "journal_entry": [{
-                "food": "milk", 
-                "quantity": 2,
-                "quantity_units": "cups",
-                "comments": ["Assuming 1% milk", "Assuming a glass is 2 cups"] 
-            },
-            {
-                "food": "cookie", 
-                "quantity": 1,
-                "quantity_units": "cookies",
-                "comments": ["Assuming a 50g chocolate chip cookie"] 
-            }],
-          "warnings": []
-        }
-        
-        If all food that will be journaled is provided, just give an empty array of new foods. Warnings
-        can be given as an array of strings when there is a problem. Try to keep the response valid json.
-        """
-    }, {
-        "role": "user",
-        "content": " Here are the foods I know of: \n" + str(food.json)
-    }, {
-        "role": "user",
-        "content": "Here is what I want to journal: \n" + str(request.json["message"])
-    }]
+    try:
+        # Check if the query and model are in the cache and if it's recent
+        cache_entry = db.session.query(GPTCache).filter(
+            GPTCache.query == request_query,
+            GPTCache.model == request_model
+        ).one()
 
-    chat_model = openai.Model.retrieve(request.json.get("model", default_gpt_model))
-    completion = openai.ChatCompletion.create(
-        model=chat_model.id,
-        messages=messages
-    )
-    return completion
+        if cache_entry.is_recent():
+            return cache_entry.response  # Use the cached response
+    except NoResultFound:
+        # If not in cache or not recent, proceed to make a new GPT request
+        food = get_foods()
+        messages = [{
+            "role": "system",
+            "content": """
+                Create a json object with nutritional information about what is described to you. Sometimes
+                you will need to guess the nutritional information. For liquids prefer 100 grams. For example, 
+                if a user wants to track a glass of milk, and there isn't the food item in the context. New 
+                foods should also be updated when a new conversion is needed, but in that case you can skip
+                macros and calories if they are not changed. Example:
+
+                "A glass of milk and a cookie"
+
+                { "new_foods": [ {
+                    "name": "1% Milk",
+                    "quantity": 100,
+                    "quantity_units": "grams",
+                    "calories": 123.33333333333334,
+                    "conversions": { "cups": 0.425 },
+                    "macros": {
+                        "carbs": 0.002,
+                        "fat": 10.7,
+                        "protein": 0.02
+                    }, {
+                    "name": "Chocolate Chip Cookie",
+                    "quantity": 1,
+                    "quantity_units": "cookies",
+                    "calories": 4000,
+                    "conversions": { "grams": 50 },
+                    "macros": {
+                        "carbs": 30,
+                        "fat": 20,
+                        "protein": 3
+                    }
+                ], "journal_entry": [{
+                        "food": "milk", 
+                        "quantity": 2,
+                        "quantity_units": "cups",
+                        "comments": ["Assuming 1% milk", "Assuming a glass is 2 cups"] 
+                    },
+                    {
+                        "food": "cookie", 
+                        "quantity": 1,
+                        "quantity_units": "cookies",
+                        "comments": ["Assuming a 50g chocolate chip cookie"] 
+                    }],
+                  "warnings": []
+                }
+
+                If all food that will be journaled is provided, just give an empty array of new foods. Warnings
+                can be given as an array of strings when there is a problem. Try to keep the response valid json.
+                """
+        }, {
+            "role": "user",
+            "content": " Here are the foods I know of: \n" + str(food.json)
+        }, {
+            "role": "user",
+            "content": "Here is what I want to journal: \n" + str(request.json["message"])
+        }]
+
+        chat_model = openai.Model.retrieve(request_model)
+        completion = openai.ChatCompletion.create(
+            model=chat_model.id,
+            messages=messages
+        )
+
+        # Cache the new response
+        new_cache_entry = GPTCache(
+            query=request_query,
+            model=request_model,
+            response=completion
+        )
+        db.session.add(new_cache_entry)
+        db.session.commit()
+
+        return completion
 
 
 if __name__ == '__main__':

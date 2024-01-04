@@ -90,6 +90,18 @@ class FoodLog(CalorieBase):
     meal_type = Column(Enum('SNACK', 'BREAKFAST', 'LUNCH', 'DINNER', name='meal_type_enum', create_type=False))
 
 
+class GPTCache(CalorieBase):
+    __tablename__ = 'GPTCache'
+    id = Column(BigInteger, primary_key=True)
+    query = Column(String, nullable=False)
+    model = Column(String, nullable=False)
+    response = Column(JSON, nullable=False)
+    timestamp = Column(TIMESTAMP, default=datetime.utcnow)
+
+    def is_recent(self):
+        return datetime.utcnow() - self.timestamp < timedelta(days=30)
+
+
 # You can then create an engine and create all tables
 # engine = create_engine('postgresql://username:password@localhost/dbname')
 # Base.metadata.create_all(engine)
